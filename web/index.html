@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#081321">
+    <title>Training Library Stream</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <header class="hero">
+      <p class="eyebrow">LIVE FOLDER CATALOG</p>
+      <h1>Training Library</h1>
+      <p id="status" class="status" role="status">Loading your library…</p>
+      <div class="summary" aria-label="Library summary">
+        <span><strong id="category-count">–</strong> categories</span>
+        <span><strong id="file-count">–</strong> files</span>
+        <span id="updated-at">Not yet scanned</span>
+      </div>
+    </header>
+    <main>
+      <div class="toolbar">
+        <label class="search-label" for="search">Search the whole library</label>
+        <input id="search" type="search" placeholder="e.g. Azure, PDF, Python" autocomplete="off">
+        <label class="sort-label" for="sort">Sort</label>
+        <select id="sort" aria-label="Sort library">
+          <option value="kind">Sort: kind</option>
+          <option value="name">Sort: name</option>
+        </select>
+        <button id="refresh" type="button">Refresh now</button>
+      </div>
+      <p id="empty" class="empty" hidden>No matching folders or files.</p>
+      <section id="preview" class="preview" hidden aria-live="polite">
+        <div class="preview-header"><h2 id="preview-title">Preview</h2><button id="close-preview" type="button">Close</button></div>
+        <div id="viewer" class="viewer"></div>
+      </section>
+      <section id="catalog" class="catalog" aria-live="polite"></section>
+    </main>
+    <template id="tree-template">
+      <details class="tree-item">
+        <summary></summary>
+        <div class="children"></div>
+      </details>
+    </template>
+    <script src="app.js"></script>
+  </body>
+</html>
