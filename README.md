@@ -16,7 +16,7 @@ Install and sign in to Tailscale on the Windows computer that holds this folder 
 
 `https://your-device.your-tailnet.ts.net`
 
-Tailscale Serve provisions the trusted certificate and securely proxies to the local catalog. The app itself stays on `http://127.0.0.1:8794` and is not directly reachable from the LAN.
+Tailscale Serve provisions the trusted certificate and securely proxies `https://<device-name>.<tailnet>.ts.net:8446` to the local catalog. The app itself stays on `http://127.0.0.1:8794` and is not directly reachable from the LAN.
 
 Do not use Tailscale Funnel for this app; Tailscale Serve keeps the catalog private to your Tailnet.
 
@@ -26,7 +26,7 @@ For a boot-time service that restarts after a failure, open **Administrator Powe
 
 `Set-ExecutionPolicy -Scope Process Bypass; ./install-startup-service.ps1`
 
-This creates a Windows startup task, then configures Tailscale Serve to provide the catalog through trusted HTTPS on port 443.
+This creates a Windows startup task, then configures Tailscale Serve to provide the catalog through trusted HTTPS on its dedicated external port `8446`.
 
 ## Next improvements
 
