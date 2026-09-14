@@ -1,105 +1,20 @@
-const catalog = document.querySelector('#catalog');
-const search = document.querySelector('#search');
-const sort = document.querySelector('#sort');
-const empty = document.querySelector('#empty');
-const status = document.querySelector('#status');
-const preview = document.querySelector('#preview');
-const previewTitle = document.querySelector('#preview-title');
-const viewer = document.querySelector('#viewer');
-let library = null;
-let progressByPath = {};
-
-const mediaExtensions = new Set(['mp4', 'webm', 'ogv', 'm4v', 'mov']);
-const audioExtensions = new Set(['mp3', 'wav', 'ogg', 'm4a', 'flac']);
-const imageExtensions = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg']);
-const embeddedExtensions = new Set(['pdf', 'txt', 'md', 'csv', 'json', 'html', 'htm']);
-const icon = item => item.type === 'folder' ? '▸' : mediaExtensions.has(item.extension) ? '▶' : '•';
-const fileUrl = item => `/files/${item.relativePath.split('/').map(encodeURIComponent).join('/')}`;
-const formatTime = seconds => { const total = Math.floor(seconds || 0); return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, '0')}s`; };
-function itemMeta(item) {
-  if (item.type !== 'file') return `${item.fileCount} files`;
-  const progress = progressByPath[item.relativePath];
-  if (!mediaExtensions.has(item.extension) || !progress) return item.extension;
-  if (progress.duration && progress.position >= progress.duration - 5) return `${item.extension} · completed`;
-  return `${item.extension} · watched ${formatTime(progress.position)}`;
-}
-
-function compareItems(a, b) {
-  if (sort.value === 'name') return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-  const kindA = a.type === 'folder' ? '0-folder' : `1-${a.extension || 'other'}`;
-  const kindB = b.type === 'folder' ? '0-folder' : `1-${b.extension || 'other'}`;
-  return kindA.localeCompare(kindB) || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-}
-function hasMatch(item, term) {
-  return item.name.toLowerCase().includes(term) || item.relativePath.toLowerCase().includes(term) || (item.children || []).some(child => hasMatch(child, term));
-}
-function addNode(item, target, term = '') {
-  const matches = !term || item.name.toLowerCase().includes(term) || item.relativePath.toLowerCase().includes(term);
-  const matchingChildren = (item.children || []).filter(child => matches || hasMatch(child, term)).sort(compareItems);
-  if (!matches && !matchingChildren.length) return false;
-  const row = document.createElement(item.type === 'folder' ? 'details' : 'button');
-  row.className = `tree-item ${item.type}`;
-  if (item.type === 'folder') row.open = Boolean(term);
-  if (item.type === 'file') { row.type = 'button'; row.addEventListener('click', () => openPreview(item)); }
-  const label = document.createElement(item.type === 'folder' ? 'summary' : 'span');
-  label.className = 'item-label';
-  label.innerHTML = `<span class="icon" aria-hidden="true">${icon(item)}</span><span class="item-name">${escapeHtml(item.name)}</span>${item.type === 'unavailable' ? '<span class="meta">Unavailable</span>' : `<span class="meta">${escapeHtml(itemMeta(item))}</span>`}`;
-  row.append(label);
-  if (item.type === 'folder' && matchingChildren.length) {
-    const children = document.createElement('div'); children.className = 'children';
-    matchingChildren.forEach(child => addNode(child, children, term)); row.append(children);
-  }
-  target.append(row); return true;
-}
-function escapeHtml(value) { const e = document.createElement('span'); e.textContent = value; return e.innerHTML; }
-function render() {
-  const term = search.value.trim().toLowerCase(); catalog.replaceChildren();
-  let shown = 0;
-  [...library.categories].sort(compareItems).forEach(category => { if (addNode(category, catalog, term)) shown++; });
-  empty.hidden = shown !== 0;
-}
-function openPreview(item) {
-  const url = fileUrl(item); const ext = item.extension;
-  previewTitle.textContent = item.name; preview.hidden = false; viewer.replaceChildren();
-  let element;
-  if (mediaExtensions.has(ext)) {
-    element = document.createElement('video'); element.controls = true; element.autoplay = true; element.preload = 'metadata';
-    let lastSaved = 0;
-    element.addEventListener('loadedmetadata', () => {
-      const saved = progressByPath[item.relativePath];
-      if (saved && saved.position > 5 && saved.position < element.duration - 5) element.currentTime = saved.position;
-    });
-    const save = () => {
-      if (!Number.isFinite(element.currentTime) || !Number.isFinite(element.duration)) return;
-      lastSaved = element.currentTime;
-      progressByPath[item.relativePath] = { position: element.currentTime, duration: element.duration };
-      fetch('/api/progress', { method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true, body: JSON.stringify({ relativePath: item.relativePath, position: element.currentTime, duration: element.duration }) }).catch(() => {});
-    };
-    element.addEventListener('timeupdate', () => { if (element.currentTime - lastSaved >= 5) save(); });
-    element.addEventListener('pause', save); element.addEventListener('ended', save);
-  }
-  else if (audioExtensions.has(ext)) { element = document.createElement('audio'); element.controls = true; element.autoplay = true; }
-  else if (imageExtensions.has(ext)) { element = document.createElement('img'); element.alt = item.name; }
-  else if (embeddedExtensions.has(ext)) { element = document.createElement('iframe'); element.title = `Preview of ${item.name}`; }
-  else { element = document.createElement('div'); element.className = 'unsupported'; element.innerHTML = '<p>This file format is not natively previewed by this browser.</p>'; }
-  if (element.tagName !== 'DIV') element.src = url;
-  viewer.append(element);
-  const open = document.createElement('a'); open.href = url; open.target = '_blank'; open.rel = 'noopener'; open.textContent = 'Open or download file'; open.className = 'open-file'; viewer.append(open);
-  preview.scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-async function load() {
-  status.textContent = 'Refreshing library…';
-  try {
-    const [response, progressResponse] = await Promise.all([fetch('/api/library', { cache: 'no-store' }), fetch('/api/progress', { cache: 'no-store' })]);
-    if (!response.ok) throw new Error('Catalog request failed');
-    library = await response.json(); progressByPath = progressResponse.ok ? await progressResponse.json() : {};
-    document.querySelector('#category-count').textContent = library.summary.categories;
-    document.querySelector('#file-count').textContent = library.summary.files;
-    document.querySelector('#updated-at').textContent = `Updated ${new Date(library.generatedAt).toLocaleString()}`;
-    status.textContent = 'Live — changes appear automatically.'; render();
-  } catch { status.textContent = 'Could not reach the library server.'; }
-}
-search.addEventListener('input', () => library && render()); sort.addEventListener('change', () => library && render());
-document.querySelector('#refresh').addEventListener('click', load); document.querySelector('#close-preview').addEventListener('click', () => { preview.hidden = true; viewer.replaceChildren(); });
-const events = new EventSource('/events'); events.addEventListener('library-change', load); events.onerror = () => { status.textContent = 'Live connection paused — retrying…'; };
-load();
+let trainingPath = '';
+const $ = selector => document.querySelector(selector);
+const media = new Set(['mp4','webm','ogv','m4v','mov']), audio = new Set(['mp3','wav','ogg','m4a','flac']), images = new Set(['jpg','jpeg','png','gif','webp','svg']), embedded = new Set(['pdf','txt','md','csv','json','html','htm']);
+let folder = null, progress = {};
+const bytes = value => value ? new Intl.NumberFormat(undefined,{notation:value>999999?'compact':'standard',maximumFractionDigits:1}).format(value)+' B' : '0 B';
+const time = seconds => { const total=Math.floor(seconds||0); return `${Math.floor(total/60)}m ${String(total%60).padStart(2,'0')}s`; };
+const escape = value => { const span=document.createElement('span'); span.textContent=value; return span.innerHTML; };
+const url = item => `/files?path=${encodeURIComponent(item.path)}`;
+function meta(item) { const watched=progress[item.path]; if(item.kind==='folder') return 'Folder'; if(media.has(item.extension)&&watched) return watched.duration&&watched.position>=watched.duration-5?`${item.extension} · completed`:`${item.extension} · watched ${time(watched.position)}`; return `${item.extension||'file'} · ${bytes(item.size)}`; }
+function compare(a,b) { const mode=$('#sort').value; if(mode==='name') return a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'}); if(mode==='modified') return b.modified.localeCompare(a.modified)||a.name.localeCompare(b.name); if(mode==='size') return b.size-a.size||a.name.localeCompare(b.name); const ak=a.kind==='folder'?'0-folder':`1-${a.extension||'other'}`,bk=b.kind==='folder'?'0-folder':`1-${b.extension||'other'}`; return ak.localeCompare(bk)||a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'}); }
+function renderFolder() { if(!folder) return; const term=$('#search').value.trim().toLowerCase(), items=folder.entries.filter(item=>!term||item.name.toLowerCase().includes(term)).sort(compare); const catalog=$('#catalog'); catalog.replaceChildren(); items.forEach(item=>{ const card=document.createElement('button'); card.type='button'; card.className=`item-card ${item.kind}`; const icon=item.kind==='folder'?'▰':media.has(item.extension)?'▶':audio.has(item.extension)?'♪':images.has(item.extension)?'▧':'•'; card.innerHTML=`<span class="item-icon" aria-hidden="true">${icon}</span><span class="item-main"><strong>${escape(item.name)}</strong><small>${escape(meta(item))}</small></span>${item.kind==='folder'?'<span class="chevron" aria-hidden="true">›</span>':''}`; card.onclick=()=>item.kind==='folder'?openFolder(item.path):openPreview(item); catalog.append(card); }); $('#empty').hidden=items.length!==0; $('#folder-summary').textContent=`${items.length} shown of ${folder.entries.length} visible items · refreshed ${new Date(folder.refreshedAt).toLocaleTimeString()}`; }
+function breadcrumbs() { const nav=$('#breadcrumbs'); nav.replaceChildren(); if(!folder) return; const bits=folder.path.replaceAll('/','\\').split('\\').filter(Boolean); let path=bits[0]?.endsWith(':')?`${bits[0]}\\`:''; bits.forEach((bit,index)=>{ if(index>0) path+=`${bit}\\`; const target=index===0?`${bit}\\`:path.replace(/\\$/,''); const crumb=document.createElement('button'); crumb.type='button'; crumb.textContent=bit; crumb.title=target; crumb.onclick=()=>openFolder(target); nav.append(crumb); }); $('#back').disabled=!folder.parent; }
+async function openFolder(path) { $('#status').textContent='Opening folder…'; try { const response=await fetch(`/api/browse?path=${encodeURIComponent(path)}`,{cache:'no-store'}), data=await response.json(); if(!response.ok) throw Error(data.error||'Folder request failed'); folder=data; $('#home-view').hidden=true; $('#browser-view').hidden=false; $('#preview').hidden=true; $('#viewer').replaceChildren(); history.replaceState({path},'', '#browse'); breadcrumbs(); renderFolder(); $('#status').textContent='Ready — only this folder is loaded.'; } catch(error) { $('#status').textContent=error.message||'Could not open this folder.'; } }
+function openHome() { folder=null; $('#home-view').hidden=false; $('#browser-view').hidden=true; $('#preview').hidden=true; $('#viewer').replaceChildren(); history.replaceState({},'', '#home'); $('#status').textContent='Choose a local drive or your Training Library.'; }
+function openPreview(item) { const extension=item.extension; $('#preview-title').textContent=item.name; $('#preview').hidden=false; const viewer=$('#viewer'); viewer.replaceChildren(); let element;
+  if(media.has(extension)) { element=document.createElement('video'); element.controls=true; element.autoplay=true; element.preload='metadata'; let savedAt=0; element.onloadedmetadata=()=>{const saved=progress[item.path];if(saved&&saved.position>5&&saved.position<element.duration-5)element.currentTime=saved.position;}; const save=()=>{if(!Number.isFinite(element.currentTime)||!Number.isFinite(element.duration))return;savedAt=element.currentTime;progress[item.path]={position:element.currentTime,duration:element.duration};fetch('/api/progress',{method:'POST',headers:{'Content-Type':'application/json'},keepalive:true,body:JSON.stringify({path:item.path,position:element.currentTime,duration:element.duration})}).catch(()=>{});}; element.ontimeupdate=()=>{if(element.currentTime-savedAt>=5)save();};element.onpause=save;element.onended=save;
+  } else if(audio.has(extension)) { element=document.createElement('audio'); element.controls=true;element.autoplay=true; } else if(images.has(extension)) { element=document.createElement('img');element.alt=item.name; } else if(embedded.has(extension)) { element=document.createElement('iframe');element.title=`Preview of ${item.name}`; } else { element=document.createElement('div');element.className='unsupported';element.innerHTML='<p>This format cannot be previewed directly by this browser.</p>'; }
+  if(element.tagName!=='DIV') element.src=url(item); viewer.append(element); const link=document.createElement('a');link.href=url(item);link.target='_blank';link.rel='noopener';link.textContent='Open or download file';link.className='open-file';viewer.append(link); $('#preview').scrollIntoView({behavior:'smooth',block:'start'}); }
+async function loadDrives() { try { const [driveResponse,progressResponse]=await Promise.all([fetch('/api/drives',{cache:'no-store'}),fetch('/api/progress',{cache:'no-store'})]); const data=await driveResponse.json();if(!driveResponse.ok)throw Error();trainingPath=data.trainingPath||'';progress=progressResponse.ok?await progressResponse.json():{};const grid=$('#drive-grid');grid.replaceChildren();data.drives.forEach(drive=>{const card=document.createElement('button');card.type='button';card.className='drive-card';card.innerHTML=`<span class="drive-icon">▣</span><span><strong>${escape(drive.name)}</strong><small>${bytes(drive.free)} free of ${bytes(drive.total)}</small></span><span class="chevron">›</span>`;card.onclick=()=>openFolder(drive.path);grid.append(card);});$('#training-path').textContent=trainingPath;$('#status').textContent='Choose a local drive or your Training Library.';}catch{$('#status').textContent='Could not reach the library server.';} }
+$('#search').oninput=renderFolder;$('#sort').onchange=renderFolder;$('#home').onclick=openHome;$('#back').onclick=()=>folder?.parent&&openFolder(folder.parent);$('#refresh-drives').onclick=loadDrives;$('#refresh-folder').onclick=()=>folder&&openFolder(folder.path);$('#training-shortcut').onclick=()=>openFolder(trainingPath);$('#close-preview').onclick=()=>{$('#preview').hidden=true;$('#viewer').replaceChildren();};loadDrives();

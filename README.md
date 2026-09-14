@@ -1,35 +1,29 @@
-# Training Library Stream
+# Training Navigator
 
-A small, dependency-free web app that turns this training folder into a live, searchable catalog. Every page refresh scans the current folders and files; open browsers also receive a refresh signal within five seconds of a change.
+A private, dependency-free media browser for this Windows PC. It opens on your local fixed disks and loads one folder at a time, so browsing remains fast even with a large training collection.
 
-## Run it
+## What it does
 
-1. Open PowerShell in this folder.
-2. Run `./start-training-library.ps1`.
-3. Open `http://localhost:8794`.
+- Starts with clear drive cards and a direct Training Library shortcut.
+- Opens folders on demand with breadcrumbs, Back, Refresh, folder filtering, and kind-first sorting.
+- Plays supported video and audio files; previews images, PDFs, text, and browser-readable files.
+- Saves video position on the server, so the same video resumes on any signed-in Tailnet device.
+- Keeps hidden, system, and the app's own data/publishing folders out of the browser.
 
-The server deliberately scans only this project folder, skips hidden/system tooling folders, and never alters training content.
+## Private HTTPS address
 
-## Access it over Tailscale
+On a device signed in to this Tailnet, open:
 
-Install and sign in to Tailscale on the Windows computer that holds this folder and on the other computer or mobile device. Enable MagicDNS and HTTPS Certificates once in the Tailnet DNS settings, then run the startup installer below. From another device on the same Tailnet, open:
+`https://your-device.your-tailnet.ts.net:8446`
 
-`https://your-device.your-tailnet.ts.net`
+Tailscale Serve provides the HTTPS certificate and proxies this private Tailnet address to `http://127.0.0.1:8794`. It is not exposed directly to the local network or public internet.
 
-Tailscale Serve provisions the trusted certificate and securely proxies `https://<device-name>.<tailnet>.ts.net:8446` to the local catalog. The app itself stays on `http://127.0.0.1:8794` and is not directly reachable from the LAN.
+## Run and start after boot
 
-Do not use Tailscale Funnel for this app; Tailscale Serve keeps the catalog private to your Tailnet.
+For a one-off local session, run `./start-training-library.ps1` and open `http://localhost:8794`.
 
-## Keep it running after restart
-
-For a boot-time service that restarts after a failure, open **Administrator PowerShell** once and run:
+For a boot-time Windows service, open **Administrator PowerShell** once and run:
 
 `Set-ExecutionPolicy -Scope Process Bypass; ./install-startup-service.ps1`
 
-This creates a Windows startup task, then configures Tailscale Serve to provide the catalog through trusted HTTPS on its dedicated external port `8446`.
-
-## Next improvements
-
-- Add thumbnails and direct file opening where supported.
-- Save favourites and recently viewed courses.
-- Add a password gate or Tailscale identity-aware sharing for selected people.
+The installer creates the Windows startup task, restarts the app after a failure, and configures the dedicated private Tailnet HTTPS port.

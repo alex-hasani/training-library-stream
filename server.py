@@ -1,242 +1,126 @@
-#!/usr/bin/env python3
-"""Training Library Stream - a dependency-free, local folder catalog."""
-
+"""Private, dependency-free Training Navigator server."""
 from __future__ import annotations
-
-import json
-import mimetypes
-import os
-import re
-import tempfile
-import threading
+import ctypes, json, mimetypes, os, re
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
-WEB_ROOT = ROOT / "web"
-PORT = int(os.environ.get("TRAINING_LIBRARY_PORT", "8794"))
-# Tailscale Serve handles encrypted Tailnet traffic and proxies it here.
-# Keeping the app on loopback avoids exposing the raw HTTP port to the LAN.
-HOST = os.environ.get("TRAINING_LIBRARY_HOST", "127.0.0.1")
-IGNORED = {".git", ".svn", "__pycache__", "node_modules", ".DS_Store"}
-APP_ENTRIES = {"web", "app-data", "repository-packages", "server.py", "start-training-library.ps1", "install-startup-service.ps1", "README.md", ".gitignore"}
-APP_DATA = ROOT / "app-data"
-PROGRESS_FILE = APP_DATA / "watch-progress.json"
-PROGRESS_LOCK = threading.Lock()
+WEB_ROOT, DATA_ROOT = ROOT / "web", ROOT / "app-data"
+PROGRESS_FILE = DATA_ROOT / "watch-progress.json"
+HOST, PORT = "127.0.0.1", 8794
+HIDDEN_ROOTS = {(ROOT / "app-data").resolve(), (ROOT / "repository-packages").resolve()}
+DRIVE_FIXED, HIDDEN_OR_SYSTEM = 3, 0x2 | 0x4
 
+def fixed_drives():
+    if os.name != "nt": return [Path("/")]
+    mask, kernel32, drives = ctypes.windll.kernel32.GetLogicalDrives(), ctypes.windll.kernel32, []
+    for index in range(26):
+        if mask & (1 << index):
+            drive = Path(f"{chr(65 + index)}:/")
+            if kernel32.GetDriveTypeW(str(drive)) == DRIVE_FIXED: drives.append(drive)
+    return drives
 
-def iso_time(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
+def under(path, root):
+    try: path.relative_to(root); return True
+    except ValueError: return False
 
+def allowed_path(raw, directory=False):
+    if not raw: raise ValueError("A path is required.")
+    path = Path(raw).expanduser().resolve()
+    if not any(under(path, drive.resolve()) for drive in fixed_drives()): raise ValueError("Only local fixed drives can be browsed.")
+    if any(path == hidden or under(path, hidden) for hidden in HIDDEN_ROOTS): raise ValueError("This application data folder is not browsable.")
+    if not path.exists(): raise ValueError("This item is no longer available.")
+    if directory and not path.is_dir(): raise ValueError("This path is not a folder.")
+    if not directory and not path.is_file(): raise ValueError("This path is not a file.")
+    return path
 
-def safe_child(path: Path) -> bool:
-    return path.name not in IGNORED and not path.name.startswith(".") and not path.is_symlink()
+def drive_payload(drive):
+    free, total, available = ctypes.c_ulonglong(), ctypes.c_ulonglong(), ctypes.c_ulonglong()
+    try: ctypes.windll.kernel32.GetDiskFreeSpaceExW(str(drive), ctypes.byref(available), ctypes.byref(total), ctypes.byref(free))
+    except OSError: pass
+    return {"name": drive.drive or str(drive), "path": str(drive), "total": total.value, "free": free.value}
 
-
-def scan_folder(path: Path, is_folder: bool | None = None) -> dict:
-    """Return a JSON-friendly tree. Permission errors are represented safely."""
+def entry_payload(entry):
     try:
-        is_folder = path.is_dir() if is_folder is None else is_folder
-        node = {
-            "name": path.name,
-            "type": "folder" if is_folder else "file",
-            "relativePath": str(path.relative_to(ROOT)).replace("\\", "/"),
-        }
-        if not is_folder:
-            node["extension"] = path.suffix.lower().lstrip(".") or "other"
-            return node
-        children = []
-        # scandir keeps type metadata with the directory listing. Avoiding a separate
-        # stat call per file matters for a large OneDrive-backed training library.
-        with os.scandir(path) as entries:
-            visible = [entry for entry in entries if entry.name not in IGNORED and not entry.name.startswith(".") and not entry.is_symlink()]
-        for entry in sorted(visible, key=lambda item: (not item.is_dir(), item.name.lower())):
-            children.append(scan_folder(Path(entry.path), entry.is_dir()))
-        node["children"] = children
-        node["fileCount"] = sum(count_files(child) for child in children)
-        return node
-    except (OSError, PermissionError) as error:
-        return {"name": path.name, "type": "unavailable", "relativePath": str(path.relative_to(ROOT)).replace("\\", "/"), "error": str(error)}
+        stat = entry.stat(follow_symlinks=False)
+        if entry.name.startswith(".") or getattr(stat, "st_file_attributes", 0) & HIDDEN_OR_SYSTEM: return None
+        path = Path(entry.path).resolve()
+        if any(path == hidden or under(path, hidden) for hidden in HIDDEN_ROOTS): return None
+        folder = entry.is_dir(follow_symlinks=False)
+        return {"name": entry.name, "path": str(path), "kind": "folder" if folder else "file", "extension": "" if folder else path.suffix.lower().lstrip("."), "size": 0 if folder else stat.st_size, "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()}
+    except OSError: return None
 
-
-def count_files(node: dict) -> int:
-    if node["type"] == "file":
-        return 1
-    return node.get("fileCount", 0)
-
-
-def library_snapshot() -> dict:
-    categories = []
-    with os.scandir(ROOT) as entries:
-        visible = [entry for entry in entries if entry.name not in IGNORED and entry.name not in APP_ENTRIES and not entry.name.startswith(".") and not entry.is_symlink()]
-    for entry in sorted(visible, key=lambda item: item.name.lower()):
-        categories.append(scan_folder(Path(entry.path), entry.is_dir()))
-    files = sum(count_files(category) for category in categories)
-    folders = sum(1 for category in categories if category["type"] == "folder")
-    return {"generatedAt": iso_time(datetime.now().timestamp()), "root": ROOT.name, "summary": {"categories": folders, "files": files}, "categories": categories}
-
-
-def watch_progress() -> dict:
+def browse(directory):
     try:
-        return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+        with os.scandir(directory) as scanner: entries = [item for entry in scanner if (item := entry_payload(entry))]
+    except PermissionError: raise ValueError("This folder cannot be read with the current Windows account.")
+    parent = directory.parent if directory.parent != directory else None
+    if parent and not any(under(parent, drive.resolve()) for drive in fixed_drives()): parent = None
+    return {"path": str(directory), "parent": str(parent) if parent else None, "entries": entries, "refreshedAt": datetime.now(timezone.utc).isoformat()}
 
+def load_progress():
+    try:
+        data = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError): return {}
 
-def update_watch_progress(relative_path: str, position: float, duration: float) -> None:
-    with PROGRESS_LOCK:
-        progress = watch_progress()
-        progress[relative_path] = {
-            "position": round(max(0, position), 1),
-            "duration": round(max(0, duration), 1),
-            "updatedAt": iso_time(datetime.now().timestamp()),
-        }
-        APP_DATA.mkdir(exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=APP_DATA, suffix=".tmp") as temporary:
-            json.dump(progress, temporary, ensure_ascii=False, indent=2)
-            temporary_path = Path(temporary.name)
-        temporary_path.replace(PROGRESS_FILE)
+def save_progress(data):
+    DATA_ROOT.mkdir(exist_ok=True); temporary = PROGRESS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"); temporary.replace(PROGRESS_FILE)
 
-
-class LibraryHandler(SimpleHTTPRequestHandler):
-    def translate_path(self, path: str) -> str:
-        parsed = urlparse(path).path
-        if parsed == "/":
-            parsed = "/index.html"
-        return str(WEB_ROOT / parsed.lstrip("/"))
-
-    def do_GET(self) -> None:
-        endpoint = urlparse(self.path).path
-        if endpoint == "/api/library":
-            self.send_json(library_snapshot())
-        elif endpoint == "/api/progress":
-            self.send_json(watch_progress())
-        elif endpoint.startswith("/files/"):
-            self.send_library_file(unquote(endpoint.removeprefix("/files/")))
-        elif endpoint == "/events":
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs): super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store"); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "SAMEORIGIN"); super().end_headers()
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/drives": return self.send_json({"drives": [drive_payload(drive) for drive in fixed_drives()], "trainingPath": str(ROOT)})
+        if parsed.path == "/api/browse": return self.handle_browse(parse_qs(parsed.query))
+        if parsed.path == "/api/progress": return self.send_json(load_progress())
+        if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), False)
+        return super().do_GET()
+    def do_HEAD(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), True)
+        return super().do_HEAD()
+    def do_POST(self):
+        if urlparse(self.path).path != "/api/progress": self.send_error(HTTPStatus.NOT_FOUND); return
+        try:
+            payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8"))
+            path = allowed_path(str(payload.get("path", ""))); position, duration = max(0, float(payload.get("position", 0))), max(0, float(payload.get("duration", 0)))
+            data = load_progress(); data[str(path)] = {"position": position, "duration": duration, "updatedAt": datetime.now(timezone.utc).isoformat()}; save_progress(data); self.send_json({"ok": True})
+        except (ValueError, TypeError, json.JSONDecodeError) as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+    def handle_browse(self, query):
+        try: self.send_json(browse(allowed_path(unquote(query.get("path", [""])[0]), True)))
+        except ValueError as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+    def send_json(self, payload, status=HTTPStatus.OK):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8"); self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def serve_file(self, query, head_only):
+        try:
+            path = allowed_path(unquote(query.get("path", [""])[0])); size = path.stat().st_size; start, end, status = 0, max(0, size - 1), HTTPStatus.OK
+            if range_header := self.headers.get("Range"):
+                match = re.match(r"bytes=(\d*)-(\d*)$", range_header)
+                if not match: raise ValueError("Invalid byte range.")
+                left, right = match.groups()
+                if left: start, end = int(left), int(right) if right else end
+                elif right: start = max(0, size - int(right))
+                if start > end or start >= size: self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE); return
+                end, status = min(end, size - 1), HTTPStatus.PARTIAL_CONTENT
+            self.send_response(status); self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream"); self.send_header("Content-Length", str(end - start + 1)); self.send_header("Accept-Ranges", "bytes"); self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{path.name}")
+            if status == HTTPStatus.PARTIAL_CONTENT: self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.end_headers()
-            try:
-                # A snapshot is checked every five seconds. This avoids installing a watcher
-                # and keeps the catalog current for every computer on the Tailnet.
-                previous = ""
-                while True:
-                    current = json.dumps(library_snapshot(), sort_keys=True, ensure_ascii=False)
-                    if current != previous:
-                        self.wfile.write(b"event: library-change\\n")
-                        self.wfile.write(b"data: refresh\\n\\n")
-                        self.wfile.flush()
-                        previous = current
-                    import time
-                    time.sleep(5)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-        else:
-            super().do_GET()
-
-    def do_POST(self) -> None:
-        if urlparse(self.path).path != "/api/progress":
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 16_384:
-                raise ValueError
-            body = json.loads(self.rfile.read(length))
-            relative_path = str(body["relativePath"])
-            requested = (ROOT / relative_path).resolve()
-            requested.relative_to(ROOT)
-            if not requested.is_file() or requested.relative_to(ROOT).parts[0] in APP_ENTRIES:
-                raise ValueError
-            update_watch_progress(relative_path, float(body["position"]), float(body.get("duration", 0)))
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid progress update")
-            return
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self.end_headers()
-
-    def do_HEAD(self) -> None:
-        endpoint = urlparse(self.path).path
-        if endpoint.startswith("/files/"):
-            self.send_library_file(unquote(endpoint.removeprefix("/files/")), send_body=False)
-        else:
-            super().do_HEAD()
-
-    def send_library_file(self, relative_path: str, send_body: bool = True) -> None:
-        """Serve a catalogued file safely, including byte ranges for video seeking."""
-        try:
-            requested = (ROOT / relative_path).resolve()
-            requested.relative_to(ROOT)
-            if not requested.is_file() or requested.relative_to(ROOT).parts[0] in APP_ENTRIES:
-                raise FileNotFoundError
-        except (OSError, ValueError, FileNotFoundError):
-            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
-            return
-
-        size = requested.stat().st_size
-        start, end = 0, size - 1
-        status = HTTPStatus.OK
-        range_header = self.headers.get("Range")
-        if range_header:
-            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
-            if not match:
-                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                return
-            first, last = match.groups()
-            if first:
-                start = int(first)
-                end = int(last) if last else end
-            elif last:
-                start = max(0, size - int(last))
-            if start >= size or start > end:
-                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                return
-            end = min(end, size - 1)
-            status = HTTPStatus.PARTIAL_CONTENT
-
-        content_type = mimetypes.guess_type(str(requested))[0] or "application/octet-stream"
-        length = end - start + 1
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(length))
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{requested.name}")
-        if status == HTTPStatus.PARTIAL_CONTENT:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.end_headers()
-        if not send_body:
-            return
-        with requested.open("rb") as source:
-            source.seek(start)
-            remaining = length
-            while remaining:
-                chunk = source.read(min(64 * 1024, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                remaining -= len(chunk)
-
-    def send_json(self, payload: dict) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}")
-
+            if not head_only:
+                with path.open("rb") as source:
+                    source.seek(start); remaining = end - start + 1
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk: break
+                        self.wfile.write(chunk); remaining -= len(chunk)
+        except (OSError, ValueError) as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
 if __name__ == "__main__":
-    print(f"Training Library Stream is available at http://localhost:{PORT}")
-    print(f"Scanning: {ROOT}")
-    print("Use the Tailscale URL shown in README.md from other devices.")
-    ThreadingHTTPServer((HOST, PORT), LibraryHandler).serve_forever()
+    print(f"Training Navigator listening at http://{HOST}:{PORT}")
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
