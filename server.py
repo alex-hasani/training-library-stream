@@ -109,7 +109,7 @@ class Handler(SimpleHTTPRequestHandler):
                 elif right: start = max(0, size - int(right))
                 if start > end or start >= size: self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE); return
                 end, status = min(end, size - 1), HTTPStatus.PARTIAL_CONTENT
-            self.send_response(status); self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream"); self.send_header("Content-Length", str(end - start + 1)); self.send_header("Accept-Ranges", "bytes"); self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{path.name}")
+            self.send_response(status); self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream"); self.send_header("Content-Length", str(end - start + 1)); self.send_header("Accept-Ranges", "bytes")
             if status == HTTPStatus.PARTIAL_CONTENT: self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.end_headers()
             if not head_only:
