@@ -39,9 +39,12 @@ def allowed_path(raw, directory=False):
 
 def drive_payload(drive):
     free, total, available = ctypes.c_ulonglong(), ctypes.c_ulonglong(), ctypes.c_ulonglong()
+    label = ctypes.create_unicode_buffer(261)
     try: ctypes.windll.kernel32.GetDiskFreeSpaceExW(str(drive), ctypes.byref(available), ctypes.byref(total), ctypes.byref(free))
     except OSError: pass
-    return {"name": drive.drive or str(drive), "path": str(drive), "total": total.value, "free": free.value}
+    try: ctypes.windll.kernel32.GetVolumeInformationW(str(drive), label, len(label), None, None, None, None, 0)
+    except OSError: pass
+    return {"name": drive.drive or str(drive), "label": label.value or "Local storage", "path": str(drive), "total": total.value, "free": free.value}
 
 def entry_payload(entry):
     try:
