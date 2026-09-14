@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT, DATA_ROOT = ROOT / "web", ROOT / "app-data"
 PROGRESS_FILE = DATA_ROOT / "watch-progress.json"
+COLLECTIONS_FILE = DATA_ROOT / "collections.json"
 HOST, PORT = "127.0.0.1", 8794
 HIDDEN_ROOTS = {(ROOT / "app-data").resolve(), (ROOT / "repository-packages").resolve()}
 DRIVE_REMOVABLE, DRIVE_FIXED, HIDDEN_OR_SYSTEM = 2, 3, 0x2 | 0x4
@@ -27,14 +28,14 @@ def under(path, root):
     try: path.relative_to(root); return True
     except ValueError: return False
 
-def allowed_path(raw, directory=False):
+def allowed_path(raw, directory=None):
     if not raw: raise ValueError("A path is required.")
     path = Path(raw).expanduser().resolve()
     if not any(under(path, drive.resolve()) for drive in browsable_drives()): raise ValueError("Only mounted local drives can be browsed.")
     if any(path == hidden or under(path, hidden) for hidden in HIDDEN_ROOTS): raise ValueError("This application data folder is not browsable.")
     if not path.exists(): raise ValueError("This item is no longer available.")
-    if directory and not path.is_dir(): raise ValueError("This path is not a folder.")
-    if not directory and not path.is_file(): raise ValueError("This path is not a file.")
+    if directory is True and not path.is_dir(): raise ValueError("This path is not a folder.")
+    if directory is False and not path.is_file(): raise ValueError("This path is not a file.")
     return path
 
 def drive_payload(drive):
@@ -74,6 +75,26 @@ def save_progress(data):
     DATA_ROOT.mkdir(exist_ok=True); temporary = PROGRESS_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"); temporary.replace(PROGRESS_FILE)
 
+def load_collections():
+    try:
+        data = json.loads(COLLECTIONS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("favorites", []), list) and isinstance(data.get("playlists", []), list): return data
+    except (OSError, json.JSONDecodeError): pass
+    return {"favorites": [], "playlists": []}
+
+def save_collections(data):
+    DATA_ROOT.mkdir(exist_ok=True); temporary = COLLECTIONS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"); temporary.replace(COLLECTIONS_FILE)
+
+def collection_view(data=None):
+    data = data or load_collections()
+    def describe(raw):
+        try:
+            path = allowed_path(raw, None); stat = path.stat(); folder = path.is_dir()
+            return {"name": path.name or str(path), "path": str(path), "kind": "folder" if folder else "file", "extension": "" if folder else path.suffix.lower().lstrip("."), "size": 0 if folder else stat.st_size, "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()}
+        except (OSError, ValueError): return None
+    return {"favorites": [item for path in data["favorites"] if (item := describe(path))], "playlists": [{"name": playlist.get("name", "Playlist"), "items": [item for path in playlist.get("items", []) if (item := describe(path))]} for playlist in data["playlists"]]}
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs): super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
     def end_headers(self):
@@ -83,6 +104,7 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/drives": return self.send_json({"drives": [drive_payload(drive) for drive in browsable_drives()], "trainingPath": str(ROOT)})
         if parsed.path == "/api/browse": return self.handle_browse(parse_qs(parsed.query))
         if parsed.path == "/api/progress": return self.send_json(load_progress())
+        if parsed.path == "/api/collections": return self.send_json(collection_view())
         if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), False)
         return super().do_GET()
     def do_HEAD(self):
@@ -90,12 +112,34 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), True)
         return super().do_HEAD()
     def do_POST(self):
-        if urlparse(self.path).path != "/api/progress": self.send_error(HTTPStatus.NOT_FOUND); return
+        endpoint = urlparse(self.path).path
         try:
             payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8"))
-            path = allowed_path(str(payload.get("path", ""))); position, duration = max(0, float(payload.get("position", 0))), max(0, float(payload.get("duration", 0)))
-            data = load_progress(); data[str(path)] = {"position": position, "duration": duration, "updatedAt": datetime.now(timezone.utc).isoformat()}; save_progress(data); self.send_json({"ok": True})
+            if endpoint == "/api/progress":
+                path = allowed_path(str(payload.get("path", ""))); position, duration = max(0, float(payload.get("position", 0))), max(0, float(payload.get("duration", 0)))
+                data = load_progress(); data[str(path)] = {"position": position, "duration": duration, "updatedAt": datetime.now(timezone.utc).isoformat()}; save_progress(data); self.send_json({"ok": True})
+            elif endpoint == "/api/favorites": self.update_favorite(payload)
+            elif endpoint == "/api/playlists": self.update_playlist(payload)
+            else: self.send_error(HTTPStatus.NOT_FOUND)
         except (ValueError, TypeError, json.JSONDecodeError) as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+    def update_favorite(self, payload):
+        path = str(allowed_path(str(payload.get("path", "")), None)); collections = load_collections()
+        if bool(payload.get("favorite", True)):
+            if path not in collections["favorites"]: collections["favorites"].append(path)
+        elif path in collections["favorites"]: collections["favorites"].remove(path)
+        save_collections(collections); self.send_json(collection_view(collections))
+
+    def update_playlist(self, payload):
+        name = str(payload.get("name", "")).strip()
+        if not name or len(name) > 80: raise ValueError("Playlist names must contain 1 to 80 characters.")
+        collections = load_collections(); playlist = next((item for item in collections["playlists"] if item.get("name", "").casefold() == name.casefold()), None)
+        if playlist is None:
+            playlist = {"name": name, "items": []}; collections["playlists"].append(playlist)
+        if payload.get("path"):
+            path = str(allowed_path(str(payload["path"]), None))
+            if path not in playlist["items"]: playlist["items"].append(path)
+        save_collections(collections); self.send_json(collection_view(collections))
     def handle_browse(self, query):
         try: self.send_json(browse(allowed_path(unquote(query.get("path", [""])[0]), True)))
         except ValueError as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
