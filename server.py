@@ -14,6 +14,7 @@ COLLECTIONS_FILE = DATA_ROOT / "collections.json"
 HOST, PORT = "127.0.0.1", 8794
 HIDDEN_ROOTS = {(ROOT / "app-data").resolve(), (ROOT / "repository-packages").resolve()}
 DRIVE_REMOVABLE, DRIVE_FIXED, HIDDEN_OR_SYSTEM = 2, 3, 0x2 | 0x4
+VIDEO_TYPES = {".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".flv": "video/x-flv", ".wmv": "video/x-ms-wmv", ".mpeg": "video/mpeg", ".mpg": "video/mpeg", ".ts": "video/mp2t", ".m2ts": "video/mp2t", ".3gp": "video/3gpp"}
 
 def browsable_drives():
     if os.name != "nt": return [Path("/")]
@@ -156,7 +157,7 @@ class Handler(SimpleHTTPRequestHandler):
                 elif right: start = max(0, size - int(right))
                 if start > end or start >= size: self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE); return
                 end, status = min(end, size - 1), HTTPStatus.PARTIAL_CONTENT
-            self.send_response(status); self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream"); self.send_header("Content-Length", str(end - start + 1)); self.send_header("Accept-Ranges", "bytes")
+            self.send_response(status); self.send_header("Content-Type", VIDEO_TYPES.get(path.suffix.lower(), mimetypes.guess_type(path.name)[0] or "application/octet-stream")); self.send_header("Content-Length", str(end - start + 1)); self.send_header("Accept-Ranges", "bytes")
             if status == HTTPStatus.PARTIAL_CONTENT: self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.end_headers()
             if not head_only:
