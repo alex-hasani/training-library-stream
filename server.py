@@ -12,15 +12,15 @@ WEB_ROOT, DATA_ROOT = ROOT / "web", ROOT / "app-data"
 PROGRESS_FILE = DATA_ROOT / "watch-progress.json"
 HOST, PORT = "127.0.0.1", 8794
 HIDDEN_ROOTS = {(ROOT / "app-data").resolve(), (ROOT / "repository-packages").resolve()}
-DRIVE_FIXED, HIDDEN_OR_SYSTEM = 3, 0x2 | 0x4
+DRIVE_REMOVABLE, DRIVE_FIXED, HIDDEN_OR_SYSTEM = 2, 3, 0x2 | 0x4
 
-def fixed_drives():
+def browsable_drives():
     if os.name != "nt": return [Path("/")]
     mask, kernel32, drives = ctypes.windll.kernel32.GetLogicalDrives(), ctypes.windll.kernel32, []
     for index in range(26):
         if mask & (1 << index):
             drive = Path(f"{chr(65 + index)}:/")
-            if kernel32.GetDriveTypeW(str(drive)) == DRIVE_FIXED: drives.append(drive)
+            if kernel32.GetDriveTypeW(str(drive)) in (DRIVE_FIXED, DRIVE_REMOVABLE) and drive.exists(): drives.append(drive)
     return drives
 
 def under(path, root):
@@ -30,7 +30,7 @@ def under(path, root):
 def allowed_path(raw, directory=False):
     if not raw: raise ValueError("A path is required.")
     path = Path(raw).expanduser().resolve()
-    if not any(under(path, drive.resolve()) for drive in fixed_drives()): raise ValueError("Only local fixed drives can be browsed.")
+    if not any(under(path, drive.resolve()) for drive in browsable_drives()): raise ValueError("Only mounted local drives can be browsed.")
     if any(path == hidden or under(path, hidden) for hidden in HIDDEN_ROOTS): raise ValueError("This application data folder is not browsable.")
     if not path.exists(): raise ValueError("This item is no longer available.")
     if directory and not path.is_dir(): raise ValueError("This path is not a folder.")
@@ -58,7 +58,7 @@ def browse(directory):
         with os.scandir(directory) as scanner: entries = [item for entry in scanner if (item := entry_payload(entry))]
     except PermissionError: raise ValueError("This folder cannot be read with the current Windows account.")
     parent = directory.parent if directory.parent != directory else None
-    if parent and not any(under(parent, drive.resolve()) for drive in fixed_drives()): parent = None
+    if parent and not any(under(parent, drive.resolve()) for drive in browsable_drives()): parent = None
     return {"path": str(directory), "parent": str(parent) if parent else None, "entries": entries, "refreshedAt": datetime.now(timezone.utc).isoformat()}
 
 def load_progress():
@@ -77,7 +77,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store"); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "SAMEORIGIN"); super().end_headers()
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/api/drives": return self.send_json({"drives": [drive_payload(drive) for drive in fixed_drives()], "trainingPath": str(ROOT)})
+        if parsed.path == "/api/drives": return self.send_json({"drives": [drive_payload(drive) for drive in browsable_drives()], "trainingPath": str(ROOT)})
         if parsed.path == "/api/browse": return self.handle_browse(parse_qs(parsed.query))
         if parsed.path == "/api/progress": return self.send_json(load_progress())
         if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), False)
