@@ -17,6 +17,8 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Keeps Training Library Stream available on this PC and Tailnet.' -Force | Out-Null
 
+Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 Start-ScheduledTask -TaskName $taskName
 & $tailscale.Source serve --https=8446 --bg http://127.0.0.1:8794
 Write-Host 'Installed: starts at boot, restarts after failure, and is available through Tailscale HTTPS on port 8446.'
