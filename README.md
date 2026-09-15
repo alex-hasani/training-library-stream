@@ -16,11 +16,11 @@ On a device signed in to this Tailnet, open:
 
 `https://your-device.your-tailnet.ts.net:8446`
 
-Tailscale Serve provides the HTTPS certificate and proxies this private Tailnet address to `http://127.0.0.1:8794`. It is not exposed directly to the local network or public internet.
+Tailscale Serve provides the HTTPS certificate and proxies this private Tailnet address to `http://127.0.0.1:8796`. It is not exposed directly to the local network or public internet.
 
 ## Run and start after boot
 
-For a one-off local session, run `./start-training-library.ps1` and open `http://localhost:8794`.
+For a one-off local session, run `./start-training-library.ps1` and open `http://localhost:8796`.
 
 For a boot-time Windows service, open **Administrator PowerShell** once and run:
 
