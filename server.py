@@ -189,8 +189,13 @@ class Handler(SimpleHTTPRequestHandler):
             path = allowed_path(unquote(query.get("path", [""])[0]), False); executable = ffmpeg_path()
             if not executable: raise ValueError("FFmpeg is not configured for this server.")
             command = [executable, "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", "0:v:0?", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-            self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "video/mp4"); self.send_header("Cache-Control", "no-store"); self.end_headers()
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+            first_chunk = process.stdout.read(64 * 1024)
+            if not first_chunk:
+                error_message = process.stderr.read().decode("utf-8", "replace").strip() or "FFmpeg could not convert this video."
+                process.wait()
+                raise ValueError(error_message[:500])
+            self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "video/mp4"); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(first_chunk)
             try:
                 while chunk := process.stdout.read(64 * 1024): self.wfile.write(chunk)
             except (BrokenPipeError, ConnectionResetError): pass
