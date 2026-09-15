@@ -1,6 +1,6 @@
 """Private, dependency-free Training Navigator server."""
 from __future__ import annotations
-import ctypes, json, mimetypes, os, re, shutil, subprocess, threading
+import ctypes, hashlib, json, mimetypes, os, re, shutil, subprocess, threading
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +13,10 @@ PROGRESS_FILE = DATA_ROOT / "watch-progress.json"
 COLLECTIONS_FILE = DATA_ROOT / "collections.json"
 FFMPEG_CONFIG = DATA_ROOT / "ffmpeg-path.txt"
 COLLECTIONS_LOCK = threading.Lock()
+CACHE_ROOT = DATA_ROOT / "transcoded-media"
+TRANSCODE_LOCK = threading.Lock()
+TRANSCODE_JOBS = {}
+TRANSCODE_ERRORS = {}
 HOST, PORT = "127.0.0.1", int(os.environ.get("TRAINING_NAVIGATOR_PORT", "8796"))
 HIDDEN_ROOTS = {(ROOT / "app-data").resolve(), (ROOT / "repository-packages").resolve()}
 DRIVE_REMOVABLE, DRIVE_FIXED, HIDDEN_OR_SYSTEM = 2, 3, 0x2 | 0x4
@@ -96,6 +100,33 @@ def ffmpeg_path():
     except OSError: pass
     return shutil.which("ffmpeg")
 
+def transcode_key(path):
+    stat = path.stat()
+    return hashlib.sha256(f"{path}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")).hexdigest()
+
+def prepare_transcode(path):
+    executable, key = ffmpeg_path(), transcode_key(path)
+    if not executable: raise ValueError("FFmpeg is not configured for this server.")
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True); output = CACHE_ROOT / f"{key}.mp4"
+    if output.is_file() and output.stat().st_size > 0: return {"state": "ready", "key": key}
+    with TRANSCODE_LOCK:
+        if key in TRANSCODE_ERRORS: raise ValueError(TRANSCODE_ERRORS[key])
+        if key not in TRANSCODE_JOBS:
+            temporary = CACHE_ROOT / f"{key}.partial.mp4"
+            command = [executable, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", "0:v:0?", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-movflags", "+faststart", str(temporary)]
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+            def finish():
+                try:
+                    _, errors = process.communicate()
+                    if process.returncode == 0 and temporary.is_file() and temporary.stat().st_size > 0: temporary.replace(output)
+                    else:
+                        message = errors.decode("utf-8", "replace").strip().splitlines()
+                        TRANSCODE_ERRORS[key] = message[-1] if message else "FFmpeg could not convert this video."
+                finally:
+                    with TRANSCODE_LOCK: TRANSCODE_JOBS.pop(key, None)
+            threading.Thread(target=finish, daemon=True).start(); TRANSCODE_JOBS[key] = True
+    return {"state": "preparing", "key": key}
+
 def collection_view(data=None):
     data = data or load_collections()
     def describe(raw):
@@ -115,12 +146,15 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/browse": return self.handle_browse(parse_qs(parsed.query))
         if parsed.path == "/api/progress": return self.send_json(load_progress())
         if parsed.path == "/api/collections": return self.send_json(collection_view())
+        if parsed.path == "/api/prepare": return self.handle_prepare(parse_qs(parsed.query))
         if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), False)
+        if parsed.path == "/converted": return self.serve_converted(parse_qs(parsed.query), False)
         if parsed.path == "/transcode": return self.transcode_file(parse_qs(parsed.query))
         return super().do_GET()
     def do_HEAD(self):
         parsed = urlparse(self.path)
         if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), True)
+        if parsed.path == "/converted": return self.serve_converted(parse_qs(parsed.query), True)
         return super().do_HEAD()
     def do_POST(self):
         endpoint = urlparse(self.path).path
@@ -182,6 +216,11 @@ class Handler(SimpleHTTPRequestHandler):
     def handle_browse(self, query):
         try: self.send_json(browse(allowed_path(unquote(query.get("path", [""])[0]), True)))
         except ValueError as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+    def handle_prepare(self, query):
+        try:
+            path = allowed_path(unquote(query.get("path", [""])[0]), False); result = prepare_transcode(path)
+            self.send_json(result, HTTPStatus.OK if result["state"] == "ready" else HTTPStatus.ACCEPTED)
+        except ValueError as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
     def send_json(self, payload, status=HTTPStatus.OK):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8"); self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def transcode_file(self, query):
@@ -203,9 +242,19 @@ class Handler(SimpleHTTPRequestHandler):
                 if process.poll() is None: process.kill()
                 process.wait()
         except (OSError, ValueError) as error: self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+    def serve_converted(self, query, head_only):
+        key = query.get("key", [""])[0]
+        if not re.fullmatch(r"[a-f0-9]{64}", key): self.send_error(HTTPStatus.NOT_FOUND); return
+        path = CACHE_ROOT / f"{key}.mp4"
+        if not path.is_file(): self.send_error(HTTPStatus.NOT_FOUND); return
+        self.serve_path(path, head_only)
     def serve_file(self, query, head_only):
         try:
-            path = allowed_path(unquote(query.get("path", [""])[0])); size = path.stat().st_size; start, end, status = 0, max(0, size - 1), HTTPStatus.OK
+            self.serve_path(allowed_path(unquote(query.get("path", [""])[0]), False), head_only)
+        except (OSError, ValueError) as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+    def serve_path(self, path, head_only):
+        try:
+            size = path.stat().st_size; start, end, status = 0, max(0, size - 1), HTTPStatus.OK
             if range_header := self.headers.get("Range"):
                 match = re.match(r"bytes=(\d*)-(\d*)$", range_header)
                 if not match: raise ValueError("Invalid byte range.")
