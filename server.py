@@ -1,6 +1,6 @@
 """Private, dependency-free Training Navigator server."""
 from __future__ import annotations
-import ctypes, json, mimetypes, os, re
+import ctypes, json, mimetypes, os, re, shutil, subprocess, threading
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parent
 WEB_ROOT, DATA_ROOT = ROOT / "web", ROOT / "app-data"
 PROGRESS_FILE = DATA_ROOT / "watch-progress.json"
 COLLECTIONS_FILE = DATA_ROOT / "collections.json"
+FFMPEG_CONFIG = DATA_ROOT / "ffmpeg-path.txt"
+COLLECTIONS_LOCK = threading.Lock()
 HOST, PORT = "127.0.0.1", 8794
 HIDDEN_ROOTS = {(ROOT / "app-data").resolve(), (ROOT / "repository-packages").resolve()}
 DRIVE_REMOVABLE, DRIVE_FIXED, HIDDEN_OR_SYSTEM = 2, 3, 0x2 | 0x4
@@ -87,6 +89,13 @@ def save_collections(data):
     DATA_ROOT.mkdir(exist_ok=True); temporary = COLLECTIONS_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"); temporary.replace(COLLECTIONS_FILE)
 
+def ffmpeg_path():
+    try:
+        configured = Path(FFMPEG_CONFIG.read_text(encoding="utf-8").strip())
+        if configured.is_file(): return str(configured)
+    except OSError: pass
+    return shutil.which("ffmpeg")
+
 def collection_view(data=None):
     data = data or load_collections()
     def describe(raw):
@@ -94,7 +103,7 @@ def collection_view(data=None):
             path = allowed_path(raw, None); stat = path.stat(); folder = path.is_dir()
             return {"name": path.name or str(path), "path": str(path), "kind": "folder" if folder else "file", "extension": "" if folder else path.suffix.lower().lstrip("."), "size": 0 if folder else stat.st_size, "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()}
         except (OSError, ValueError): return None
-    return {"favorites": [item for path in data["favorites"] if (item := describe(path))], "playlists": [{"name": playlist.get("name", "Playlist"), "items": [item for path in playlist.get("items", []) if (item := describe(path))]} for playlist in data["playlists"]]}
+    return {"favorites": [item for path in data["favorites"] if (item := describe(path)) and item["kind"] == "folder"], "playlists": [{"name": playlist.get("name", "Playlist"), "items": [item for path in playlist.get("items", []) if (item := describe(path)) and item["kind"] == "file"]} for playlist in data["playlists"]]}
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs): super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
@@ -107,6 +116,7 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/progress": return self.send_json(load_progress())
         if parsed.path == "/api/collections": return self.send_json(collection_view())
         if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), False)
+        if parsed.path == "/transcode": return self.transcode_file(parse_qs(parsed.query))
         return super().do_GET()
     def do_HEAD(self):
         parsed = urlparse(self.path)
@@ -125,27 +135,69 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, json.JSONDecodeError) as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
     def update_favorite(self, payload):
-        path = str(allowed_path(str(payload.get("path", "")), None)); collections = load_collections()
-        if bool(payload.get("favorite", True)):
-            if path not in collections["favorites"]: collections["favorites"].append(path)
-        elif path in collections["favorites"]: collections["favorites"].remove(path)
-        save_collections(collections); self.send_json(collection_view(collections))
+        path = str(allowed_path(str(payload.get("path", "")), True))
+        with COLLECTIONS_LOCK:
+            collections = load_collections()
+            if bool(payload.get("favorite", True)):
+                if path not in collections["favorites"]: collections["favorites"].append(path)
+            elif path in collections["favorites"]: collections["favorites"].remove(path)
+            save_collections(collections); response = collection_view(collections)
+        self.send_json(response)
 
     def update_playlist(self, payload):
-        name = str(payload.get("name", "")).strip()
-        if not name or len(name) > 80: raise ValueError("Playlist names must contain 1 to 80 characters.")
-        collections = load_collections(); playlist = next((item for item in collections["playlists"] if item.get("name", "").casefold() == name.casefold()), None)
-        if playlist is None:
-            playlist = {"name": name, "items": []}; collections["playlists"].append(playlist)
-        if payload.get("path"):
-            path = str(allowed_path(str(payload["path"]), None))
-            if path not in playlist["items"]: playlist["items"].append(path)
-        save_collections(collections); self.send_json(collection_view(collections))
+        action, name = str(payload.get("action", "create")), str(payload.get("name", "")).strip()
+        def valid(value):
+            if not value or len(value) > 80: raise ValueError("Playlist names must contain 1 to 80 characters.")
+            return value
+        with COLLECTIONS_LOCK:
+            collections = load_collections()
+            find = lambda value: next((item for item in collections["playlists"] if item.get("name", "").casefold() == value.casefold()), None)
+            if action == "create":
+                name = valid(name)
+                if find(name): raise ValueError("A playlist with this name already exists.")
+                collections["playlists"].append({"name": name, "items": []})
+            elif action == "add":
+                path = str(allowed_path(str(payload.get("path", "")), False)); names = payload.get("names", [])
+                if not isinstance(names, list) or not names: raise ValueError("Select at least one playlist.")
+                for selected in names:
+                    playlist = find(valid(str(selected).strip()))
+                    if not playlist: raise ValueError("One selected playlist no longer exists.")
+                    if path not in playlist["items"]: playlist["items"].append(path)
+            elif action == "rename":
+                playlist, new_name = find(valid(str(payload.get("oldName", "")).strip())), valid(name)
+                if not playlist: raise ValueError("Playlist not found.")
+                if playlist["name"].casefold() != new_name.casefold() and find(new_name): raise ValueError("A playlist with this name already exists.")
+                playlist["name"] = new_name
+            elif action == "delete":
+                playlist = find(valid(name))
+                if not playlist: raise ValueError("Playlist not found.")
+                collections["playlists"].remove(playlist)
+            elif action == "remove-item":
+                playlist = find(valid(name)); path = str(allowed_path(str(payload.get("path", "")), False))
+                if not playlist: raise ValueError("Playlist not found.")
+                if path in playlist["items"]: playlist["items"].remove(path)
+            else: raise ValueError("Unknown playlist action.")
+            save_collections(collections); response = collection_view(collections)
+        self.send_json(response)
     def handle_browse(self, query):
         try: self.send_json(browse(allowed_path(unquote(query.get("path", [""])[0]), True)))
         except ValueError as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
     def send_json(self, payload, status=HTTPStatus.OK):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8"); self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def transcode_file(self, query):
+        try:
+            path = allowed_path(unquote(query.get("path", [""])[0]), False); executable = ffmpeg_path()
+            if not executable: raise ValueError("FFmpeg is not configured for this server.")
+            command = [executable, "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", "0:v:0?", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "video/mp4"); self.send_header("Cache-Control", "no-store"); self.end_headers()
+            try:
+                while chunk := process.stdout.read(64 * 1024): self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError): pass
+            finally:
+                if process.poll() is None: process.kill()
+                process.wait()
+        except (OSError, ValueError) as error: self.send_json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
     def serve_file(self, query, head_only):
         try:
             path = allowed_path(unquote(query.get("path", [""])[0])); size = path.stat().st_size; start, end, status = 0, max(0, size - 1), HTTPStatus.OK
