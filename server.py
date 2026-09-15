@@ -14,10 +14,13 @@ COLLECTIONS_FILE = DATA_ROOT / "collections.json"
 FFMPEG_CONFIG = DATA_ROOT / "ffmpeg-path.txt"
 COLLECTIONS_LOCK = threading.Lock()
 CACHE_ROOT = DATA_ROOT / "transcoded-media"
+HLS_ROOT = DATA_ROOT / "hls-media"
 TRANSCODE_LOCK = threading.Lock()
 TRANSCODE_JOBS = {}
 TRANSCODE_ERRORS = {}
-HOST, PORT = "127.0.0.1", int(os.environ.get("TRAINING_NAVIGATOR_PORT", "8796"))
+HLS_JOBS = {}
+HLS_ERRORS = {}
+HOST, PORT = "127.0.0.1", int(os.environ.get("TRAINING_NAVIGATOR_PORT", "8797"))
 HIDDEN_ROOTS = {(ROOT / "app-data").resolve(), (ROOT / "repository-packages").resolve()}
 DRIVE_REMOVABLE, DRIVE_FIXED, HIDDEN_OR_SYSTEM = 2, 3, 0x2 | 0x4
 VIDEO_TYPES = {".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".flv": "video/x-flv", ".wmv": "video/x-ms-wmv", ".mpeg": "video/mpeg", ".mpg": "video/mpeg", ".ts": "video/mp2t", ".m2ts": "video/mp2t", ".3gp": "video/3gpp"}
@@ -127,6 +130,28 @@ def prepare_transcode(path):
             threading.Thread(target=finish, daemon=True).start(); TRANSCODE_JOBS[key] = True
     return {"state": "preparing", "key": key}
 
+def prepare_hls(path):
+    executable, key = ffmpeg_path(), transcode_key(path)
+    if not executable: raise ValueError("FFmpeg is not configured for this server.")
+    output = HLS_ROOT / key; playlist = output / "index.m3u8"
+    if playlist.is_file() and playlist.stat().st_size > 0: return {"state": "ready", "key": key}
+    with TRANSCODE_LOCK:
+        if key in HLS_ERRORS: raise ValueError(HLS_ERRORS[key])
+        if key not in HLS_JOBS:
+            output.mkdir(parents=True, exist_ok=True)
+            command = [executable, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", "0:v:0?", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-f", "hls", "-hls_time", "6", "-hls_list_size", "0", "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4", "-hls_flags", "independent_segments+append_list", "-hls_segment_filename", str(output / "segment%05d.m4s"), str(playlist)]
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+            def finish_hls():
+                try:
+                    _, errors = process.communicate()
+                    if process.returncode != 0:
+                        message = errors.decode("utf-8", "replace").strip().splitlines()
+                        HLS_ERRORS[key] = message[-1] if message else "FFmpeg could not prepare this video."
+                finally:
+                    with TRANSCODE_LOCK: HLS_JOBS.pop(key, None)
+            threading.Thread(target=finish_hls, daemon=True).start(); HLS_JOBS[key] = True
+    return {"state": "preparing", "key": key}
+
 def collection_view(data=None):
     data = data or load_collections()
     def describe(raw):
@@ -147,6 +172,8 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/progress": return self.send_json(load_progress())
         if parsed.path == "/api/collections": return self.send_json(collection_view())
         if parsed.path == "/api/prepare": return self.handle_prepare(parse_qs(parsed.query))
+        if parsed.path == "/api/hls": return self.handle_hls(parse_qs(parsed.query))
+        if parsed.path.startswith("/hls/"): return self.serve_hls(parsed.path, False)
         if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), False)
         if parsed.path == "/converted": return self.serve_converted(parse_qs(parsed.query), False)
         if parsed.path == "/transcode": return self.transcode_file(parse_qs(parsed.query))
@@ -155,6 +182,7 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/files": return self.serve_file(parse_qs(parsed.query), True)
         if parsed.path == "/converted": return self.serve_converted(parse_qs(parsed.query), True)
+        if parsed.path.startswith("/hls/"): return self.serve_hls(parsed.path, True)
         return super().do_HEAD()
     def do_POST(self):
         endpoint = urlparse(self.path).path
@@ -221,6 +249,11 @@ class Handler(SimpleHTTPRequestHandler):
             path = allowed_path(unquote(query.get("path", [""])[0]), False); result = prepare_transcode(path)
             self.send_json(result, HTTPStatus.OK if result["state"] == "ready" else HTTPStatus.ACCEPTED)
         except ValueError as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+    def handle_hls(self, query):
+        try:
+            path = allowed_path(unquote(query.get("path", [""])[0]), False); result = prepare_hls(path)
+            self.send_json(result, HTTPStatus.OK if result["state"] == "ready" else HTTPStatus.ACCEPTED)
+        except ValueError as error: self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
     def send_json(self, payload, status=HTTPStatus.OK):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8"); self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def transcode_file(self, query):
@@ -248,6 +281,17 @@ class Handler(SimpleHTTPRequestHandler):
         path = CACHE_ROOT / f"{key}.mp4"
         if not path.is_file(): self.send_error(HTTPStatus.NOT_FOUND); return
         self.serve_path(path, head_only)
+    def serve_hls(self, request_path, head_only):
+        match = re.fullmatch(r"/hls/([a-f0-9]{64})/(index\.m3u8|init\.mp4|segment\d{5}\.m4s)", request_path)
+        if not match: self.send_error(HTTPStatus.NOT_FOUND); return
+        key, name = match.groups(); path = HLS_ROOT / key / name
+        if not path.is_file(): self.send_error(HTTPStatus.NOT_FOUND); return
+        content_type = "application/vnd.apple.mpegurl" if name.endswith(".m3u8") else "video/mp4" if name.endswith(".mp4") else "video/iso.segment"
+        try:
+            self.send_response(HTTPStatus.OK); self.send_header("Content-Type", content_type); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(path.stat().st_size)); self.end_headers()
+            if not head_only:
+                with path.open("rb") as source: shutil.copyfileobj(source, self.wfile)
+        except (OSError, BrokenPipeError, ConnectionResetError): pass
     def serve_file(self, query, head_only):
         try:
             self.serve_path(allowed_path(unquote(query.get("path", [""])[0]), False), head_only)

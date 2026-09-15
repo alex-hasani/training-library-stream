@@ -1,6 +1,8 @@
 let trainingPath='',folder=null,progress={},collections={favorites:[],playlists:[]},playlistItem=null,previewFromCollections=false;
 const $=s=>document.querySelector(s),media=new Set(['mp4','webm','ogv','m4v','mov','mkv','avi','flv','wmv','mpeg','mpg','ts','m2ts','3gp']),audio=new Set(['mp3','wav','ogg','m4a','flac']),images=new Set(['jpg','jpeg','png','gif','webp','svg']),embedded=new Set(['pdf','txt','md','csv','json','html','htm']),direct=new Set(['mp4','webm','ogv','m4v','mov']);
-const bytes=v=>v?new Intl.NumberFormat(undefined,{notation:v>999999?'compact':'standard',maximumFractionDigits:1}).format(v)+' B':'0 B',time=s=>{const n=Math.floor(s||0);return`${Math.floor(n/60)}m ${String(n%60).padStart(2,'0')}s`},escape=v=>{const e=document.createElement('span');e.textContent=v;return e.innerHTML},url=i=>`/files?path=${encodeURIComponent(i.path)}`,convertedUrl=key=>`/converted?key=${encodeURIComponent(key)}`;
+let hlsLoader=null;
+function loadHls(){if(window.Hls)return Promise.resolve();if(hlsLoader)return hlsLoader;hlsLoader=new Promise((resolve,reject)=>{const script=document.createElement('script');script.src='hls.min.js';script.onload=resolve;script.onerror=()=>reject(Error('Could not load the segmented video player.'));document.head.append(script)});return hlsLoader}
+const bytes=v=>v?new Intl.NumberFormat(undefined,{notation:v>999999?'compact':'standard',maximumFractionDigits:1}).format(v)+' B':'0 B',time=s=>{const n=Math.floor(s||0);return`${Math.floor(n/60)}m ${String(n%60).padStart(2,'0')}s`},escape=v=>{const e=document.createElement('span');e.textContent=v;return e.innerHTML},url=i=>`/files?path=${encodeURIComponent(i.path)}`,hlsUrl=key=>`/hls/${encodeURIComponent(key)}/index.m3u8`;
 function meta(i){const watched=progress[i.path];if(i.kind==='folder')return'Folder';if(media.has(i.extension)&&watched)return watched.duration&&watched.position>=watched.duration-5?`${i.extension} · completed`:`${i.extension} · watched ${time(watched.position)}`;return`${i.extension||'file'} · ${bytes(i.size)}`}
 function icon(i){return i.kind==='folder'?'▰':media.has(i.extension)?'▶':audio.has(i.extension)?'♪':images.has(i.extension)?'▧':'•'}
 function compare(a,b){const mode=$('#sort').value;if(mode==='name')return a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'});if(mode==='modified')return b.modified.localeCompare(a.modified)||a.name.localeCompare(b.name);if(mode==='size')return b.size-a.size||a.name.localeCompare(b.name);const ak=a.kind==='folder'?'0-folder':`1-${a.extension||'other'}`,bk=b.kind==='folder'?'0-folder':`1-${b.extension||'other'}`;return ak.localeCompare(bk)||a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'})}
@@ -26,11 +28,13 @@ async function preparePlayback(i,video,status){
   video.dataset.preparing='true';status.hidden=false;
   try{
     for(let attempt=0;attempt<720;attempt++){
-      status.textContent=attempt?'Still preparing a seekable MP4…':'Preparing a seekable MP4 with full controls…';
-      const response=await fetch(`/api/prepare?path=${encodeURIComponent(i.path)}`,{cache:'no-store'}),data=await response.json();
+      status.textContent=attempt?'Preparing the next playable video chunks…':'Preparing short, seekable video chunks…';
+      const response=await fetch(`/api/hls?path=${encodeURIComponent(i.path)}`,{cache:'no-store'}),data=await response.json();
       if(!response.ok)throw Error(data.error||'Could not prepare this video.');
       if(data.state==='ready'){
-        status.hidden=true;video.src=convertedUrl(data.key);video.load();video.play().catch(()=>{});return;
+        const source=hlsUrl(data.key);
+        if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source;video.load()}else{await loadHls();if(!window.Hls||!Hls.isSupported())throw Error('This browser cannot play segmented video.');const player=new Hls({maxBufferLength:30,maxMaxBufferLength:60});player.loadSource(source);player.attachMedia(video);video.hlsPlayer=player}
+        status.hidden=true;video.play().catch(()=>{});return;
       }
       await new Promise(resolve=>setTimeout(resolve,4000));
     }
