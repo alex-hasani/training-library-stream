@@ -1,0 +1,11 @@
+.gitignore
+.public-allowlist
+PUBLIC_RELEASE.md
+README.md
+server.py
+start-training-library.ps1
+tools/verify-public-release.ps1
+web/app.css
+web/app.js
+web/hls.min.js
+web/index.html
